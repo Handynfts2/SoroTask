@@ -155,7 +155,7 @@ class ExecutionQueue extends EventEmitter {
             }
           }
 
-          await executorFn(taskId, attemptContext);
+          const result = await executorFn(taskId, attemptContext);
 
           this.completed++;
           
@@ -173,7 +173,7 @@ class ExecutionQueue extends EventEmitter {
             });
           }
 
-          this.emit('task:success', taskId, attemptContext);
+          this.emit('task:success', taskId, attemptContext, result);
         } catch (error) {
           this.failedCount++;
           this.failedTasks.add(taskId);

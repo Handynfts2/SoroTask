@@ -20,10 +20,13 @@ pub enum Error {
     CircularDependency = 10,
     DependencyBlocked = 11,
     AlreadyInitialized = 12,
+    UnauthorizedSlasher = 13,
+    KeeperStakeTooLow = 14,
+    OperatorAlreadySet = 15,
     // Payload validation errors
-    ArgsTooMany = 13,
-    ArgsTooLarge = 14,
-    InvalidPayload = 15,
+    ArgsTooMany = 16,
+    ArgsTooLarge = 17,
+    InvalidPayload = 18,
 }
 
 /// Maximum number of arguments allowed in a task payload
@@ -61,6 +64,8 @@ pub enum DataKey {
     Counter,
     ActiveTasks,
     Token,
+    Operator,
+    KeeperStake(Address),
     TaskDependencies(u64),
 }
 
@@ -115,6 +120,30 @@ fn remove_active_task_id(env: &Env, task_id: u64) {
     }
 
     set_active_task_ids(env, &filtered);
+}
+
+fn get_operator(env: &Env) -> Option<Address> {
+    env.storage().persistent().get(&DataKey::Operator)
+}
+
+fn require_operator(env: &Env, signer: Address) {
+    let operator = get_operator(env).expect("Operator not configured");
+    if operator != signer {
+        panic_with_error!(&env, Error::UnauthorizedSlasher);
+    }
+}
+
+fn get_keeper_stake(env: &Env, keeper: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::KeeperStake(keeper.clone()))
+        .unwrap_or(0)
+}
+
+fn set_keeper_stake(env: &Env, keeper: &Address, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::KeeperStake(keeper.clone()), &amount);
 }
 
 #[contracttype]

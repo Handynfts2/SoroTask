@@ -19,6 +19,7 @@ const { GracefulShutdownManager } = require("./src/gracefulShutdown");
 const { createDefaultFilterChain } = require("./src/taskFilter");
 const { WebhookAuthProtocol, InMemoryReplayStore } = require("./src/webhookAuth");
 const { WebhookTriggerHandler } = require("./src/webhookTrigger");
+const { SLAMonitor } = require("./src/slaMonitor");
 
 // Create root logger for the main module
 const logger = createLogger("keeper");
@@ -100,6 +101,14 @@ async function main() {
 
   metricsServer.start();
 
+  const slaMonitor = new SLAMonitor(server, config.contractId, config, {
+    historyManager,
+    metricsServer,
+    operatorKeypair: keypair,
+    logger: createLogger('sla-monitor'),
+  });
+  await slaMonitor.start();
+
   // Perform startup validation to fail fast on configuration errors
   const validator = new StartupValidator(
     server,
@@ -152,12 +161,31 @@ async function main() {
       attemptId: context?.attemptId || null,
     }),
   );
-  queue.on("task:success", (taskId) => {
-    queueLogger.info("Task executed successfully", { taskId });
+  queue.on("task:success", (taskId, context, result) => {
+    queueLogger.info("Task executed successfully", { taskId, txHash: result?.txHash || null });
+    if (historyManager) {
+      historyManager.record({
+        kind: 'execution',
+        taskId,
+        keeper: keypair.publicKey(),
+        status: 'SUCCESS',
+        txHash: result?.txHash || null,
+        feePaid: result?.feePaid || null,
+      });
+    }
     shutdownManager.completeTask(taskId);
   });
-  queue.on("task:failed", (taskId, err) => {
+  queue.on("task:failed", (taskId, err, context) => {
     queueLogger.error("Task failed", { taskId, error: err.message });
+    if (historyManager) {
+      historyManager.record({
+        kind: 'execution',
+        taskId,
+        keeper: keypair.publicKey(),
+        status: 'FAILED',
+        error: err.message,
+      });
+    }
     shutdownManager.failTask(taskId, err);
     poller.invalidateCache(taskId);
   });
@@ -340,6 +368,12 @@ async function main() {
         ...status,
       });
     }
+  });
+
+  // Register SLA monitor cleanup
+  shutdownManager.registerResource("sla-monitor", async () => {
+    logger.info("Stopping SLA monitor");
+    await slaMonitor.stop();
   });
 
   // Register registry cleanup
