@@ -12,10 +12,13 @@ const { dryRunTask } = require("./src/dryRun");
 const { executeTaskWithRetry } = require("./src/executor");
 const { ExecutionIdempotencyGuard } = require("./src/idempotency");
 const { MetricsServer } = require("./src/metrics");
-const { FraudDetectionService } = require("./src/fraudDetection");
-const { ReconciliationEngine } = require("./src/reconciliation");
+const { GasMonitor } = require("./src/gasMonitor");
 const HistoryManager = require("./src/history");
+const { StreamHub } = require("./src/streamHub");
+const { ApiGateway } = require("./src/apiGateway");
+const { FailurePredictor, KeeperReputationScorer } = require("./src/insights");
 const { normalizeShardConfig, filterTasksForShard } = require("./src/sharding");
+const { PostgresShardManager } = require("./src/postgresShardManager");
 const { StartupValidator } = require("./src/validator");
 const { GracefulShutdownManager } = require("./src/gracefulShutdown");
 const { createDefaultFilterChain } = require("./src/taskFilter");
@@ -58,11 +61,32 @@ async function main() {
   }
 
   const { keypair } = keeperData;
-  const server = new Server(config.rpcUrl);
+  
+  // Load balanced RPC server creation
+  const { createRpc } = require("./src/rpc");
+  const server = await createRpc(config, createLogger("rpc"));
   const historyManager = new HistoryManager({
     logger: createLogger("history"),
   });
-  let reconciliationEngine = null;
+  const streamHub = new StreamHub({
+    logger: createLogger("stream-hub"),
+    redisUrl: process.env.REDIS_URL || null,
+    namespace: config.realtimeStreamNamespace,
+  });
+  const apiGateway = new ApiGateway({
+    logger: createLogger("api-gateway"),
+    defaultCapacity: config.apiGatewayDefaultCapacity,
+    defaultRefillPerSecond: config.apiGatewayDefaultRefillPerSecond,
+    defaultBillingUnits: config.apiGatewayDefaultBillingUnits,
+  });
+  const failurePredictor = new FailurePredictor({
+    historyManager,
+    logger: createLogger("failure-predictor"),
+  });
+  const reputationScorer = new KeeperReputationScorer({
+    historyManager,
+    logger: createLogger("reputation-scorer"),
+  });
   const shardConfig = normalizeShardConfig({
     shardIndex: config.shardIndex,
     shardCount: config.shardCount,
@@ -74,10 +98,16 @@ async function main() {
     changedAt: null,
     actor: null,
   };
-  const metricsServer = new MetricsServer(undefined, createLogger("metrics"), null, {
+
+  const gasMonitor = new GasMonitor(createLogger("gasMonitor"));
+  const metricsServer = new MetricsServer(gasMonitor, createLogger("metrics"), null, {
     port: config.metricsPort,
     healthStaleThreshold: config.healthStaleThresholdMs,
     historyManager,
+    streamHub: config.realtimeStreamEnabled ? streamHub : null,
+    apiGateway: config.apiGatewayEnabled ? apiGateway : null,
+    failurePredictor,
+    reputationScorer,
     controlStateProvider: () => ({ ...controlState }),
     controlActionHandler: async ({ paused, reason, actor }) => {
       controlState.paused = Boolean(paused);
@@ -93,27 +123,10 @@ async function main() {
       return { ...controlState };
     },
   });
-  const fraudDetector = new FraudDetectionService({
-    logger: createLogger("fraud-detection"),
-    metricsServer,
-    historyManager,
-    alertWebhookUrl: config.fraudAlertWebhookUrl,
-    alertDebounceMs: config.fraudAlertDebounceMs,
-    burstWindowMs: config.fraudBurstWindowMs,
-    failureWindowMs: config.fraudFailureWindowMs,
-    alertThreshold: config.fraudAlertThreshold,
-    feeSpikeMultiplier: config.fraudFeeSpikeMultiplier,
-    minFeeSpike: config.fraudMinFeeSpike,
-    drainMultiplier: config.fraudDrainMultiplier,
-    minDrainFee: config.fraudMinDrainFee,
-    taskBurstThreshold: config.fraudTaskBurstThreshold,
-    failureBurstThreshold: config.fraudFailureBurstThreshold,
-    crossTaskThreshold: config.fraudCrossTaskThreshold,
-    crossTaskFeeThreshold: config.fraudCrossTaskFeeThreshold,
-    webhookTimeoutMs: config.fraudAlertWebhookTimeoutMs,
-    maxAlertAttempts: config.fraudAlertMaxAttempts,
-  });
-  metricsServer.setFraudDetector(fraudDetector);
+  metricsServer.setStreamHub(config.realtimeStreamEnabled ? streamHub : null);
+  metricsServer.setApiGateway(config.apiGatewayEnabled ? apiGateway : null);
+  metricsServer.setFailurePredictor(failurePredictor);
+  metricsServer.setReputationScorer(reputationScorer);
   metricsServer.updateShardState({
     shardIndex: shardConfig.shardIndex,
     shardCount: shardConfig.shardCount,
@@ -123,6 +136,20 @@ async function main() {
   });
 
   metricsServer.start();
+
+  const dbShardManager = new PostgresShardManager({
+    baseCount: config.dbShardBaseCount,
+    maxCount: config.dbShardMaxCount,
+    scaleUpThreshold: config.dbShardScaleUpThreshold,
+    scaleDownThreshold: config.dbShardScaleDownThreshold,
+    userCapacityPerShard: config.dbShardUserCapacity,
+    taskCapacityPerShard: config.dbShardTaskCapacity,
+    enableAutoScaling: config.dbShardAutoScaling,
+  }, createLogger("db-shard"));
+  metricsServer.updateDbShardState(dbShardManager.refresh({
+    activeUsers: 0,
+    pendingTasks: 0,
+  }));
 
   // Perform startup validation to fail fast on configuration errors
   const validator = new StartupValidator(
@@ -176,7 +203,13 @@ async function main() {
       attemptId: context?.attemptId || null,
     }),
   );
-  queue.on("task:success", (taskId, context) => {
+  queue.on("task:started", (taskId, context) => {
+    metricsServer.publishTaskEvent("queue-started", taskId, {
+      attemptId: context?.attemptId || null,
+      pollCorrelationId: context?.pollCorrelationId || null,
+    });
+  });
+  queue.on("task:success", (taskId) => {
     queueLogger.info("Task executed successfully", { taskId });
     const executionResult = context?.executionResult || null;
     const finalResult = executionResult?.result || executionResult || {};
@@ -219,6 +252,7 @@ async function main() {
       }
     }
     shutdownManager.completeTask(taskId);
+    metricsServer.publishTaskEvent("queue-success", taskId);
   });
   queue.on("task:failed", (taskId, err, context) => {
     queueLogger.error("Task failed", { taskId, error: err.message });
@@ -247,6 +281,7 @@ async function main() {
     });
     shutdownManager.failTask(taskId, err);
     poller.invalidateCache(taskId);
+    metricsServer.publishTaskEvent("queue-failed", taskId, { error: err.message });
   });
   queue.on("task:skipped", (taskId, context) =>
     queueLogger.info("Skipped duplicate execution attempt", {
@@ -255,6 +290,13 @@ async function main() {
       attemptId: context?.attemptId || null,
     }),
   );
+  queue.on("task:skipped", (taskId, context) => {
+    metricsServer.publishTaskEvent("queue-skipped", taskId, {
+      reason: context?.reason || null,
+      attemptId: context?.attemptId || null,
+      pollCorrelationId: context?.pollCorrelationId || null,
+    });
+  });
   queue.on("cycle:complete", (stats) =>
     queueLogger.info("Cycle complete", stats),
   );
@@ -283,10 +325,31 @@ async function main() {
         estimatedFee: result.simulation?.estimatedFee ?? null,
         error: result.error,
       });
+      historyManager.record({
+        taskId,
+        keeper: keypair.publicKey(),
+        status: "DRY_RUN",
+        txHash: null,
+        feePaid: 0,
+        error: result.error || null,
+        classification: "dry_run",
+        attemptId: context.attemptId || null,
+        correlationId,
+      });
+      metricsServer.publishTaskEvent("dry-run", taskId, {
+        attemptId: context.attemptId || null,
+        correlationId,
+      });
       return;
     }
 
     try {
+      const dynamicFeeMultiplier = gasMonitor && typeof gasMonitor.getDynamicFeeMultiplier === 'function'
+        ? gasMonitor.getDynamicFeeMultiplier()
+        : 1;
+      deps.dynamicFeeMultiplier = dynamicFeeMultiplier;
+      deps.gasMonitor = gasMonitor;
+
       const retryResult = await executeTaskWithRetry(taskId, deps, {
         attemptId: context.attemptId,
         correlationId,
@@ -308,6 +371,22 @@ async function main() {
         duplicate: Boolean(retryResult.duplicate),
         txHash: retryResult.result?.txHash || null,
       });
+      historyManager.record({
+        taskId,
+        keeper: keypair.publicKey(),
+        status: retryResult.result?.status || "SUCCESS",
+        txHash: retryResult.result?.txHash || null,
+        feePaid: retryResult.result?.feePaid || 0,
+        error: null,
+        classification: retryResult.duplicate ? "duplicate" : "success",
+        attemptId: context.attemptId || null,
+        correlationId,
+      });
+      metricsServer.publishTaskEvent("completed", taskId, {
+        attemptId: context.attemptId || null,
+        correlationId,
+        txHash: retryResult.result?.txHash || null,
+      });
     } catch (error) {
       taskLogger.error("Failed to execute task", {
         taskId,
@@ -316,6 +395,22 @@ async function main() {
         error: error.error?.message || error.message || String(error),
         classification: error.classification || null,
         context: error.context || null,
+      });
+      historyManager.record({
+        taskId,
+        keeper: keypair.publicKey(),
+        status: "FAILED",
+        txHash: error.result?.txHash || null,
+        feePaid: error.result?.feePaid || 0,
+        error: error.error?.message || error.message || String(error),
+        classification: error.classification || null,
+        attemptId: context.attemptId || null,
+        correlationId,
+      });
+      metricsServer.publishTaskEvent("failed", taskId, {
+        attemptId: context.attemptId || null,
+        correlationId,
+        classification: error.classification || null,
       });
       throw error;
     }
@@ -541,6 +636,11 @@ async function main() {
 
       // Get list of all registered task IDs
       const taskIds = registry.getTaskIds();
+      const dbShardState = dbShardManager.refresh({
+        activeUsers: queue.getInFlightStatus().inFlight,
+        pendingTasks: taskIds.length,
+      });
+      metricsServer.updateDbShardState(dbShardState);
       const shardSelection = selectTaskOwnership(taskIds);
       metricsServer.updateShardState({
         shardIndex: shardSelection.shardIndex,
