@@ -95,10 +95,7 @@ class TaskPoller {
       ? options.filterChain
       : null;
     this.metricsServer = options.metricsServer;
-    // SLO metrics — accept direct injection (tests) or pull from metricsServer
-    this.sloMetrics = options.sloMetrics
-      || (options.metricsServer && options.metricsServer.sloMetrics)
-      || null;
+    this.config = options.config || null;
     this.historyManager = options.historyManager || null;
     this.resolverRuntime = options.resolverRuntime || null;
     this.resolverFailureMode = options.resolverFailureMode || process.env.RESOLVER_FAILURE_MODE || 'skip';
@@ -451,6 +448,22 @@ class TaskPoller {
 
       this.logPollSummary(duration, cycleLogger);
 
+      if (this.metricsServer && this.metricsServer.indicatorRegistry) {
+        this.metricsServer.indicatorRegistry.recordPollResult(true);
+
+        // Warn if poll freshness exceeds the configured stale-poll threshold
+        const freshness = this.metricsServer.indicatorRegistry.getPollFreshness();
+        const stalePollSeconds = this.config && this.config.sloThresholds
+          ? this.config.sloThresholds.stalePollSeconds
+          : 30;
+        if (freshness !== null && freshness > stalePollSeconds) {
+          this.logger.warn('Poll freshness exceeds stale-poll threshold', {
+            pollFreshnessSeconds: freshness,
+            stalePollThresholdSeconds: stalePollSeconds,
+          });
+        }
+      }
+
       return dueTaskIds;
 
     } catch (error) {
@@ -461,6 +474,9 @@ class TaskPoller {
           lastPollAt: new Date(),
           rpcConnected: false,
         });
+        if (this.metricsServer.indicatorRegistry) {
+          this.metricsServer.indicatorRegistry.recordPollResult(false);
+        }
       }
       if (this.sloMetrics) {
         this.sloMetrics.recordPollCycle({

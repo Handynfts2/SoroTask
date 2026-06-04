@@ -1,15 +1,10 @@
 const dotenv = require('dotenv');
+const { createLogger } = require('./logger');
 
 dotenv.config();
 
- export function loadConfig() {
-   const required = [
-     'SOROBAN_RPC_URL',
-     'NETWORK_PASSPHRASE',
-     'KEEPER_SECRET',
-     'CONTRACT_ID',
-     'POLLING_INTERVAL_MS',
-   ];
+const logger = createLogger('config');
+
 function parseInteger(value, fallback) {
   const parsed = parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -57,7 +52,7 @@ function loadConfig() {
     ...rpcUrlList,
   ].filter(Boolean)));
 
-  return {
+  const config = {
     rpcUrl: process.env.SOROBAN_RPC_URL,
     rpcUrls,
     rpcFailoverEnabled: parseBoolean(process.env.RPC_FAILOVER_ENABLED, rpcUrls.length > 1),
@@ -175,10 +170,25 @@ function loadConfig() {
       replayTtlMs: parseInteger(process.env.INBOUND_WEBHOOK_REPLAY_TTL_MS, 600000),
       maxBodyBytes: parseInteger(process.env.INBOUND_WEBHOOK_MAX_BODY_BYTES, 1048576),
     },
-    resolverFunctionsConfig: process.env.RESOLVER_FUNCTIONS_CONFIG || null,
-    resolverDefaultTimeoutMs: parseInteger(process.env.RESOLVER_DEFAULT_TIMEOUT_MS, 250),
-    resolverFailureMode: process.env.RESOLVER_FAILURE_MODE || 'skip',
+    // SLO threshold configuration
+    sloThresholds: {
+      stalePollSeconds: parseInteger(process.env.SLO_STALE_POLL_SECONDS, 30),
+      executionLatenessSeconds: parseInteger(process.env.SLO_EXECUTION_LATENESS_SECONDS, 60),
+      maxRetryDelaySeconds: parseInteger(process.env.SLO_MAX_RETRY_DELAY_SECONDS, 120),
+      minExecutionSuccessRate: parseFloat(process.env.SLO_MIN_EXECUTION_SUCCESS_RATE) || 0.95,
+      minPollSuccessRate: parseFloat(process.env.SLO_MIN_POLL_SUCCESS_RATE) || 0.99,
+    },
   };
+
+  logger.info('SLO thresholds active', {
+    stalePollSeconds: config.sloThresholds.stalePollSeconds,
+    executionLatenessSeconds: config.sloThresholds.executionLatenessSeconds,
+    maxRetryDelaySeconds: config.sloThresholds.maxRetryDelaySeconds,
+    minExecutionSuccessRate: config.sloThresholds.minExecutionSuccessRate,
+    minPollSuccessRate: config.sloThresholds.minPollSuccessRate,
+  });
+
+  return config;
 }
 
 module.exports = { loadConfig };
