@@ -234,32 +234,82 @@ async function main() {
       attemptId: context?.attemptId || null,
     }),
   );
-  queue.on("task:success", (taskId, context, result) => {
-    queueLogger.info("Task executed successfully", { taskId, txHash: result?.txHash || null });
-    if (historyManager) {
-      historyManager.record({
-        kind: 'execution',
+  queue.on("task:started", (taskId, context) => {
+    metricsServer.publishTaskEvent("queue-started", taskId, {
+      attemptId: context?.attemptId || null,
+      pollCorrelationId: context?.pollCorrelationId || null,
+    });
+  });
+  queue.on("task:success", (taskId) => {
+    queueLogger.info("Task executed successfully", { taskId });
+    const executionResult = context?.executionResult || null;
+    const finalResult = executionResult?.result || executionResult || {};
+    const correlationId = context?.correlationId || context?.pollCorrelationId || null;
+    const isDryRun = String(finalResult.status || "").startsWith("DRY_RUN");
+    historyManager.record({
+      kind: isDryRun ? "dry_run" : "execution",
+      taskId,
+      keeper: keypair.publicKey(),
+      status: finalResult.status || "SUCCESS",
+      txHash: finalResult.txHash || null,
+      feePaid: finalResult.feePaid || 0,
+      correlationId,
+      attemptId: context?.attemptId || null,
+    });
+    if (!isDryRun) {
+      fraudDetector.observeExecution({
         taskId,
-        keeper: keypair.publicKey(),
-        status: 'SUCCESS',
-        txHash: result?.txHash || null,
-        feePaid: result?.feePaid || null,
+        status: finalResult.status || "SUCCESS",
+        feePaid: finalResult.feePaid || 0,
+        txHash: finalResult.txHash || null,
+        correlationId,
+        attemptId: context?.attemptId || null,
+        metadata: {
+          source: "queue_success",
+          keeper: keypair.publicKey(),
+          shardLabel: shardConfig.shardLabel,
+        },
       });
+      if (reconciliationEngine) {
+        reconciliationEngine.observeExecution({
+          taskId,
+          status: finalResult.status || "SUCCESS",
+          feePaid: finalResult.feePaid || 0,
+          txHash: finalResult.txHash || null,
+          correlationId,
+          attemptId: context?.attemptId || null,
+          observedAt: new Date().toISOString(),
+        });
+      }
     }
     shutdownManager.completeTask(taskId);
     metricsServer.publishTaskEvent("queue-success", taskId);
   });
   queue.on("task:failed", (taskId, err, context) => {
     queueLogger.error("Task failed", { taskId, error: err.message });
-    if (historyManager) {
-      historyManager.record({
-        kind: 'execution',
-        taskId,
+    historyManager.record({
+      kind: "execution",
+      taskId,
+      keeper: keypair.publicKey(),
+      status: "FAILED",
+      error: err.message || String(err),
+      classification: err.classification || null,
+      correlationId: context?.correlationId || context?.pollCorrelationId || null,
+      attemptId: context?.attemptId || null,
+    });
+    fraudDetector.observeFailure({
+      taskId,
+      status: "FAILED",
+      errorCode: err.code || err.error?.code || null,
+      errorClassification: err.classification || null,
+      correlationId: context?.correlationId || context?.pollCorrelationId || null,
+      attemptId: context?.attemptId || null,
+      metadata: {
+        source: "queue_failure",
         keeper: keypair.publicKey(),
-        status: 'FAILED',
-        error: err.message,
-      });
-    }
+        shardLabel: shardConfig.shardLabel,
+      },
+    });
     shutdownManager.failTask(taskId, err);
     poller.invalidateCache(taskId);
     metricsServer.publishTaskEvent("queue-failed", taskId, { error: err.message });
@@ -299,6 +349,7 @@ async function main() {
 
     if (DRY_RUN) {
       const result = await dryRunTask(taskId, deps);
+      context.executionResult = result;
       taskLogger.info("Dry-run result", {
         taskId,
         status: result.status,
@@ -354,6 +405,7 @@ async function main() {
         },
       });
 
+      context.executionResult = retryResult;
       taskLogger.info("Task execution completed", {
         taskId,
         attemptId: context.attemptId || null,
@@ -450,16 +502,39 @@ async function main() {
   });
   await registry.init();
 
-  // Initialize reconciler — detects and repairs drift between local registry
-  // and on-chain truth. Runs on startup and then on a configurable interval.
-  const reconciler = new TaskReconciler(
-    { poller, registry },
-    { logger: createLogger("reconciler") },
-  );
+  reconciliationEngine = new ReconciliationEngine({
+    logger: createLogger("reconciliation"),
+    metricsServer,
+    historyManager,
+    alertWebhookUrl: config.reconciliationAlertWebhookUrl,
+    alertDebounceMs: config.reconciliationAlertDebounceMs,
+    webhookTimeoutMs: config.reconciliationAlertWebhookTimeoutMs,
+    maxAlertAttempts: config.reconciliationAlertMaxAttempts,
+    executionSettlingMs: config.reconciliationExecutionSettlingMs,
+    tolerance: config.reconciliationTolerance,
+  });
+  reconciliationEngine.attachRegistry(registry);
+  reconciliationEngine.seedFromTasks(registry.getTasksWithStats());
+  metricsServer.setReconciliationEngine(reconciliationEngine);
+  reconciliationEngine.reconcileSnapshot(registry.getTasksWithStats());
 
-  // Startup reconciliation: repair any drift accumulated while the keeper was
-  // offline (missed events, another keeper executing tasks, etc.).
-  logger.info("Running startup reconciliation");
+  const p2pNetwork = new KeeperP2PNetwork({
+    ...config.p2p,
+    nodeId: config.p2p.nodeId || keypair.publicKey(),
+    logger: createLogger("p2p"),
+    loadProvider: () => {
+      const queueStatus = queue.getInFlightStatus();
+      return {
+        capacity: queue.concurrencyLimit,
+        inFlight: queueStatus.inFlight,
+        queueDepth: queueStatus.depth,
+        taskCount: registry.getTaskIds().length,
+        paused: controlState.paused,
+        dryRun: DRY_RUN,
+      };
+    },
+  });
+  metricsServer.setP2PStateProvider(() => p2pNetwork.getStateSnapshot());
   try {
     const startupReport = await reconciler.reconcile();
     logger.info("Startup reconciliation complete", {
@@ -542,6 +617,9 @@ async function main() {
 
       // Poll for new TaskRegistered events
       await registry.poll();
+      if (reconciliationEngine) {
+        reconciliationEngine.reconcileSnapshot(registry.getTasksWithStats());
+      }
 
       // Get list of all registered task IDs
       const taskIds = registry.getTaskIds();
@@ -593,7 +671,13 @@ async function main() {
           shutdownManager.trackTask(typeof task === "object" ? task.taskId : task)
         );
 
-        await queue.enqueue(dueTaskIds, executeTask);
+        // Transform the dueTask results to pass correlation IDs to the queue
+        const tasksToEnqueue = dueTaskIds.map(d => ({
+          taskId: d.taskId,
+          context: { pollCorrelationId: d.correlationId }
+        }));
+        
+        await queue.enqueue(tasksToEnqueue, executeTask);
       } else {
         logger.info("No tasks due for execution");
       }
@@ -736,4 +820,3 @@ main().catch((err) => {
   logger.fatal("Fatal Keeper Error", { error: err.message, stack: err.stack });
   process.exit(1);
 });
-

@@ -64,6 +64,35 @@ class Metrics {
       severity: 'none',
       observedAt: null,
     };
+    this.fraudState = {
+      observations: 0,
+      alertsQueued: 0,
+      alertsSent: 0,
+      alertsSuppressed: 0,
+      alertsFailed: 0,
+      pipelineErrors: 0,
+      lastRiskScore: 0,
+      lastAlertAt: null,
+      lastAlertReason: null,
+      pendingAlerts: 0,
+      recentObservations: 0,
+    };
+    this.reconciliationState = {
+      reconciliations: 0,
+      executionsObserved: 0,
+      accountingChangesObserved: 0,
+      matches: 0,
+      mismatches: 0,
+      pendingExecutions: 0,
+      alertsQueued: 0,
+      alertsSent: 0,
+      alertsFailed: 0,
+      pipelineErrors: 0,
+      lastDrift: 0,
+      lastMismatchAt: null,
+      lastMismatchReason: null,
+      lastObservedAt: null,
+    };
     this.reset();
   }
 
@@ -94,9 +123,20 @@ class Metrics {
       webhookAcceptedTotal: 0,
       webhookRejectedTotal: 0,
       webhookReplayRejectedTotal: 0,
-      slaChecksTotal: 0,
-      slaViolationsTotal: 0,
-      slaSlashedTotal: 0,
+      fraudObservationsTotal: 0,
+      fraudAlertsQueuedTotal: 0,
+      fraudAlertsSentTotal: 0,
+      fraudAlertsSuppressedTotal: 0,
+      fraudAlertsFailedTotal: 0,
+      fraudPipelineErrorsTotal: 0,
+      reconciliationExecutionsObservedTotal: 0,
+      reconciliationAccountingChangesObservedTotal: 0,
+      reconciliationMatchesTotal: 0,
+      reconciliationMismatchesTotal: 0,
+      reconciliationAlertsQueuedTotal: 0,
+      reconciliationAlertsSentTotal: 0,
+      reconciliationAlertsFailedTotal: 0,
+      reconciliationPipelineErrorsTotal: 0,
     };
     this.gauges = {
       avgFeePaidXlm: 0,
@@ -111,44 +151,40 @@ class Metrics {
       executionTimelinessSloRate: 0,
       lastRetryCycleDurationMs: 0,
       rpcCircuitState: 0,
-      slaLastCheckDurationMs: 0,
-      slaLastSlashAmount: 0,
+      fraudRiskScore: 0,
+      reconciliationBalanceDrift: 0,
+      reconciliationPendingExecutions: 0,
     };
     this.feeSamples = [];
-    this.maxFeeSamples = 100;
-
-    this.startTime = Date.now();
-    this.lastPollAt = null;
-    this.lastPollCompletedAt = null;
-    this.rpcConnected = false;
-
-    // SLO thresholds (configurable, defaults set in constructor)
-    this.sloThresholds = {
-      pollFreshnessMs: 60000, // Poll should complete within 60s
-      executionTimelinessMs: 0, // Will be set from config
+    this.fraudState = {
+      observations: 0,
+      alertsQueued: 0,
+      alertsSent: 0,
+      alertsSuppressed: 0,
+      alertsFailed: 0,
+      pipelineErrors: 0,
+      lastRiskScore: 0,
+      lastAlertAt: null,
+      lastAlertReason: null,
+      pendingAlerts: 0,
+      recentObservations: 0,
     };
-
-    // Domain configuration sources
-    this.pollIntervalMs = 30000; // Default, overridden via setPollInterval
-  }
-
-  increment(key, amount = 1) {
-    if (key === 'pollFreshnessSloSuccess') {
-      this.counters.pollFreshnessSloSuccess += amount;
-    } else if (key === 'pollFreshnessSloFailure') {
-      this.counters.pollFreshnessSloFailure += amount;
-    } else if (key === 'executionTimelinessSloSuccess') {
-      this.counters.executionTimelinessSloSuccess += amount;
-    } else if (key === 'executionTimelinessSloFailure') {
-      this.counters.executionTimelinessSloFailure += amount;
-    } else if (key === 'retriesExhausted') {
-      this.counters.retriesExhausted += amount;
-    } else if (key === 'retryAttemptsTotal' && typeof amount === 'object') {
-      const outcome = amount.outcome || 'unknown';
-      if (this.counters.retryAttemptsTotal[outcome] !== undefined) {
-        this.counters.retryAttemptsTotal[outcome] += 1;
-      }
-    } else if (key in this.counters) {
+    this.reconciliationState = {
+      reconciliations: 0,
+      executionsObserved: 0,
+      accountingChangesObserved: 0,
+      matches: 0,
+      mismatches: 0,
+      pendingExecutions: 0,
+      alertsQueued: 0,
+      alertsSent: 0,
+      alertsFailed: 0,
+      pipelineErrors: 0,
+      lastDrift: 0,
+      lastMismatchAt: null,
+      lastMismatchReason: null,
+      lastObservedAt: null,
+    };
   }
 
   increment(key, amount = 1) {
@@ -249,6 +285,14 @@ class Metrics {
     this.driftState = { ...this.driftState, ...state };
   }
 
+  updateFraudState(state = {}) {
+    this.fraudState = { ...this.fraudState, ...state };
+  }
+
+  updateReconciliationState(state = {}) {
+    this.reconciliationState = { ...this.reconciliationState, ...state };
+  }
+
   snapshot() {
     return {
       ...this.counters,
@@ -258,6 +302,8 @@ class Metrics {
       shard: { ...this.shardState },
       dbShard: { ...this.dbShardState },
       drift: { ...this.driftState },
+      fraud: { ...this.fraudState },
+      reconciliation: { ...this.reconciliationState },
     };
   }
 
@@ -438,6 +484,7 @@ class MetricsServer {
     this.controlStateProvider = options.controlStateProvider || null;
     this.controlActionHandler = options.controlActionHandler || null;
     this.historyManager = options.historyManager || null;
+    this.fraudDetector = options.fraudDetector || null;
     this.webhookHandler = options.webhookHandler || null;
     this.webhookPath = options.webhookPath || '/webhooks/task-executions';
     this.p2pStateProvider = options.p2pStateProvider || null;
@@ -949,6 +996,96 @@ class MetricsServer {
       help: 'Number of tasks currently showing critical recurring drift',
       registers: [this.register],
     });
+    this.promFraudObservations = new promClient.Counter({
+      name: 'keeper_fraud_observations_total',
+      help: 'Total number of task execution observations processed by fraud detection',
+      registers: [this.register],
+    });
+    this.promFraudAlertsQueued = new promClient.Counter({
+      name: 'keeper_fraud_alerts_queued_total',
+      help: 'Total number of fraud alerts queued for delivery',
+      registers: [this.register],
+    });
+    this.promFraudAlertsSent = new promClient.Counter({
+      name: 'keeper_fraud_alerts_sent_total',
+      help: 'Total number of fraud alerts delivered or emitted locally',
+      registers: [this.register],
+    });
+    this.promFraudAlertsSuppressed = new promClient.Counter({
+      name: 'keeper_fraud_alerts_suppressed_total',
+      help: 'Total number of fraud alerts suppressed by debounce rules',
+      registers: [this.register],
+    });
+    this.promFraudAlertsFailed = new promClient.Counter({
+      name: 'keeper_fraud_alerts_failed_total',
+      help: 'Total number of fraud alerts that failed after retries',
+      registers: [this.register],
+    });
+    this.promFraudPipelineErrors = new promClient.Counter({
+      name: 'keeper_fraud_pipeline_errors_total',
+      help: 'Total number of fraud detection pipeline errors encountered',
+      registers: [this.register],
+    });
+    this.promFraudRiskScore = new promClient.Gauge({
+      name: 'keeper_fraud_risk_score',
+      help: 'Current fraud risk score produced by the heuristic engine',
+      registers: [this.register],
+    });
+    this.promFraudPendingAlerts = new promClient.Gauge({
+      name: 'keeper_fraud_pending_alerts',
+      help: 'Number of fraud alerts currently queued for delivery',
+      registers: [this.register],
+    });
+    this.promReconciliationExecutions = new promClient.Counter({
+      name: 'keeper_reconciliation_executions_total',
+      help: 'Total number of successful task executions observed by reconciliation',
+      registers: [this.register],
+    });
+    this.promReconciliationAccountingChanges = new promClient.Counter({
+      name: 'keeper_reconciliation_accounting_changes_total',
+      help: 'Total number of accounting changes observed by reconciliation',
+      registers: [this.register],
+    });
+    this.promReconciliationMatches = new promClient.Counter({
+      name: 'keeper_reconciliation_matches_total',
+      help: 'Total number of execution-to-accounting matches confirmed',
+      registers: [this.register],
+    });
+    this.promReconciliationMismatches = new promClient.Counter({
+      name: 'keeper_reconciliation_mismatches_total',
+      help: 'Total number of reconciliation mismatches detected',
+      registers: [this.register],
+    });
+    this.promReconciliationAlertsQueued = new promClient.Counter({
+      name: 'keeper_reconciliation_alerts_queued_total',
+      help: 'Total number of reconciliation alerts queued for delivery',
+      registers: [this.register],
+    });
+    this.promReconciliationAlertsSent = new promClient.Counter({
+      name: 'keeper_reconciliation_alerts_sent_total',
+      help: 'Total number of reconciliation alerts delivered or emitted locally',
+      registers: [this.register],
+    });
+    this.promReconciliationAlertsFailed = new promClient.Counter({
+      name: 'keeper_reconciliation_alerts_failed_total',
+      help: 'Total number of reconciliation alerts that failed after retries',
+      registers: [this.register],
+    });
+    this.promReconciliationPipelineErrors = new promClient.Counter({
+      name: 'keeper_reconciliation_pipeline_errors_total',
+      help: 'Total number of reconciliation pipeline errors encountered',
+      registers: [this.register],
+    });
+    this.promReconciliationDrift = new promClient.Gauge({
+      name: 'keeper_reconciliation_balance_drift',
+      help: 'Current reconciliation drift between expected and observed balances',
+      registers: [this.register],
+    });
+    this.promReconciliationPending = new promClient.Gauge({
+      name: 'keeper_reconciliation_pending_executions',
+      help: 'Number of successful executions awaiting reconciliation confirmation',
+      registers: [this.register],
+    });
 
     this.promBudgetConsumed = new promClient.Counter({
       name: 'keeper_retry_budget_consumed_total',
@@ -1162,12 +1299,61 @@ class MetricsServer {
 
       } else if (req.url === '/metrics/forecast' || req.url === '/metrics/forecast/') {
         this.handleForecast(res);
-      } else if (req.url === '/reconcile' || req.url === '/reconcile/') {
-        if (req.method === 'POST') {
-          this.handleReconcileTrigger(res);
-        } else {
-          this.handleReconcileStatus(res);
-        }
+
+      } else if (req.url === '/metrics/failure-risk' || req.url === '/metrics/failure-risk/') {
+        this.handleFailureRisk(res);
+
+      } else if (req.url === '/metrics/reputation' || req.url === '/metrics/reputation/') {
+        this.handleReputation(res);
+
+      } else if (req.url === '/metrics/slo' || req.url === '/metrics/slo/') {
+        this.handleSloMetrics(res);
+
+      } else if (url.pathname === '/metrics/history' || url.pathname === '/metrics/history/') {
+        this.handleMetricsHistory(req, res);
+
+      } else if (req.url === '/admin/billing' || req.url === '/admin/billing/') {
+        protect(() => this.handleBilling(res))();
+
+
+        // 🔐 PROTECTED ROUTES START HERE
+
+      } else if (req.url === '/admin/reset' && req.method === 'POST') {
+        protect(() => {
+          this.metrics.reset();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true }));
+        })();
+
+      } else if (req.url === '/admin/dead-letter') {
+        protect(() => this.handleDeadLetter(res))();
+
+      } else if (req.url.startsWith('/admin/dead-letter/')) {
+        protect(() => this.handleDeadLetterTask(req, res))();
+
+      } else if (req.url === '/admin/fraud' || req.url === '/admin/fraud/') {
+        protect(() => this.handleFraudState(res))();
+
+      } else if (req.url === '/admin/reconciliation' || req.url === '/admin/reconciliation/') {
+        protect(() => this.handleReconciliationState(res))();
+
+      } else if (url.pathname === this.webhookPath && this.webhookHandler) {
+        // Webhook requests (unauthenticated - auth handled by webhook handler)
+        this.webhookHandler.handle(req, res);
+
+        // ❌ NOT FOUND
+      } else if (url.pathname === '/drift' || url.pathname === '/drift/') {
+        this.handleDrift(res);
+      } else if (url.pathname === '/admin/keeper' || url.pathname === '/admin/keeper/') {
+        this.handleAdminState(req, res);
+      } else if (url.pathname === '/admin/keeper/pause' || url.pathname === '/admin/keeper/pause/') {
+        await this.handlePauseResume(req, res, true);
+      } else if (url.pathname === '/admin/keeper/resume' || url.pathname === '/admin/keeper/resume/') {
+        await this.handlePauseResume(req, res, false);
+      } else if (url.pathname === '/admin/fraud' || url.pathname === '/admin/fraud/') {
+        this.handleFraudState(res);
+      } else if (url.pathname === '/admin/reconciliation' || url.pathname === '/admin/reconciliation/') {
+        this.handleReconciliationState(res);
       } else {
         res.writeHead(404);
         res.end('Not Found');
@@ -1466,6 +1652,42 @@ class MetricsServer {
     res.end(JSON.stringify(payload, null, 2));
   }
 
+  handleFraudState(res) {
+    if (!this.fraudDetector) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Fraud detection unavailable' }));
+      return;
+    }
+
+    try {
+      const payload = this.fraudDetector.getState();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(payload, null, 2));
+    } catch (error) {
+      this.logger.error('Error reading fraud detection state', { error: error.message });
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to read fraud state' }));
+    }
+  }
+
+  handleReconciliationState(res) {
+    if (!this.reconciliationEngine) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Reconciliation unavailable' }));
+      return;
+    }
+
+    try {
+      const payload = this.reconciliationEngine.getState();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(payload, null, 2));
+    } catch (error) {
+      this.logger.error('Error reading reconciliation state', { error: error.message });
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to read reconciliation state' }));
+    }
+  }
+
   async handlePrometheusMetrics(res) {
     try {
       this.syncPrometheusMetrics();
@@ -1635,12 +1857,34 @@ class MetricsServer {
       );
     } else if (key === 'adminStateChangesTotal') {
       this.promAdminStateChanges.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'slaChecksTotal') {
-      this.promSlaChecks.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'slaViolationsTotal') {
-      this.promSlaViolations.inc(typeof amount === 'number' ? amount : 1);
-    } else if (key === 'slaSlashedTotal') {
-      this.promSlaSlashed.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'fraudObservationsTotal') {
+      this.promFraudObservations.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'fraudAlertsQueuedTotal') {
+      this.promFraudAlertsQueued.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'fraudAlertsSentTotal') {
+      this.promFraudAlertsSent.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'fraudAlertsSuppressedTotal') {
+      this.promFraudAlertsSuppressed.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'fraudAlertsFailedTotal') {
+      this.promFraudAlertsFailed.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'fraudPipelineErrorsTotal') {
+      this.promFraudPipelineErrors.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationExecutionsObservedTotal') {
+      this.promReconciliationExecutions.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationAccountingChangesObservedTotal') {
+      this.promReconciliationAccountingChanges.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationMatchesTotal') {
+      this.promReconciliationMatches.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationMismatchesTotal') {
+      this.promReconciliationMismatches.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationAlertsQueuedTotal') {
+      this.promReconciliationAlertsQueued.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationAlertsSentTotal') {
+      this.promReconciliationAlertsSent.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationAlertsFailedTotal') {
+      this.promReconciliationAlertsFailed.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationPipelineErrorsTotal') {
+      this.promReconciliationPipelineErrors.inc(typeof amount === 'number' ? amount : 1);
     }
   }
 
@@ -1664,10 +1908,8 @@ class MetricsServer {
       this.promRetryCycleDuration.set(value);
     } else if (key === 'rpcCircuitState') {
       this.promRpcCircuitState.set(value);
-    } else if (key === 'slaLastCheckDurationMs') {
-      this.promSlaLastCheckDuration.set(value);
-    } else if (key === 'slaLastSlashAmount') {
-      this.promSlaLastSlashAmount.set(value);
+    } else if (key === 'fraudRiskScore') {
+      this.promFraudRiskScore.set(value);
     }
   }
 
@@ -1681,6 +1923,18 @@ class MetricsServer {
 
   updateDriftState(state) {
     this.metrics.updateDriftState(state);
+  }
+
+  updateFraudState(state) {
+    this.metrics.updateFraudState(state);
+    this.promFraudRiskScore.set(this.metrics.fraudState.lastRiskScore || 0);
+    this.promFraudPendingAlerts.set(this.metrics.fraudState.pendingAlerts || 0);
+  }
+
+  updateReconciliationState(state) {
+    this.metrics.updateReconciliationState(state);
+    this.promReconciliationDrift.set(this.metrics.reconciliationState.lastDrift || 0);
+    this.promReconciliationPending.set(this.metrics.reconciliationState.pendingExecutions || 0);
   }
 
   updateAdminState(state) {

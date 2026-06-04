@@ -18,6 +18,8 @@ GET  /metrics
 GET  /metrics/forecast
 GET  /drift
 GET  /admin/keeper
+GET  /admin/fraud
+GET  /admin/reconciliation
 POST /admin/keeper/pause
 POST /admin/keeper/resume
 ```
@@ -74,38 +76,33 @@ The `/admin/keeper*` endpoints require `Authorization: Bearer <KEEPER_ADMIN_TOKE
 | `keeper_recurring_drift_warning_tasks` | Gauge | Number of tasks currently showing warning-level drift |
 | `keeper_recurring_drift_critical_tasks` | Gauge | Number of tasks currently showing critical drift |
 
-### SLO (Service Level Objectives) Metrics
-
-**Poll Freshness** — measures whether polling cycles complete within the expected interval.
+### Fraud Detection Metrics
 
 | Metric Name | Type | Description |
 |-------------|------|-------------|
-| `keeper_poll_freshness_seconds` | Gauge | Seconds since the last successful polling cycle completed |
-| `keeper_poll_interval_seconds` | Histogram | Seconds between consecutive polling cycle completions |
-| `keeper_poll_freshness_slo_success_total` | Counter | Total polls that met the freshness SLO threshold |
-| `keeper_poll_freshness_slo_failure_total` | Counter | Total polls that missed the freshness SLO threshold |
-| `keeper_slo_poll_freshness_rate` | Gauge | Rolling rate of poll freshness SLO success (0-1) |
+| `keeper_fraud_observations_total` | Counter | Total number of task execution observations processed by fraud detection |
+| `keeper_fraud_alerts_queued_total` | Counter | Total number of fraud alerts queued for delivery |
+| `keeper_fraud_alerts_sent_total` | Counter | Total number of fraud alerts delivered or emitted locally |
+| `keeper_fraud_alerts_suppressed_total` | Counter | Total number of fraud alerts suppressed by debounce rules |
+| `keeper_fraud_alerts_failed_total` | Counter | Total number of fraud alerts that failed after retries |
+| `keeper_fraud_pipeline_errors_total` | Counter | Total number of fraud detection pipeline errors encountered |
+| `keeper_fraud_risk_score` | Gauge | Current fraud risk score produced by the heuristic engine |
+| `keeper_fraud_pending_alerts` | Gauge | Number of fraud alerts currently queued for delivery |
 
-**Execution Timeliness** — measures how quickly tasks are executed after becoming due.
-
-| Metric Name | Type | Description |
-|-------------|------|-------------|
-| `keeper_task_execution_lateness_ledgers` | Histogram | Difference in ledger numbers between task scheduled due time and actual execution |
-| `keeper_execution_timeliness_slo_success_total` | Counter | Total tasks executed within the timeliness SLO threshold |
-| `keeper_execution_timeliness_slo_failure_total` | Counter | Total tasks that missed the timeliness SLO threshold |
-| `keeper_slo_execution_timeliness_rate` | Gauge | Rolling rate of execution timeliness SLO success (0-1) |
-
-**Retry Metrics**
+### Reconciliation Metrics
 
 | Metric Name | Type | Description |
 |-------------|------|-------------|
-| `keeper_retry_delay_seconds` | Histogram | Seconds waited before a retry attempt is made |
-| `keeper_retry_time_in_queue_seconds` | Histogram | Seconds a task spent waiting in retry queue before next attempt |
-| `keeper_retry_attempts_total` | Counter | Total number of retry attempts made (labeled by outcome: success, failure, duplicate) |
-| `keeper_retries_exhausted_total` | Counter | Total tasks that exhausted all retry attempts |
-| `keeper_retries_executed_total` | Counter | Total retried tasks that eventually succeeded |
-| `keeper_retries_failed_total` | Counter | Total retried tasks that ultimately failed |
-| `keeper_retry_queue_size` | Gauge | Current number of tasks pending retry |
+| `keeper_reconciliation_executions_total` | Counter | Total number of successful task executions observed by reconciliation |
+| `keeper_reconciliation_accounting_changes_total` | Counter | Total number of accounting changes observed by reconciliation |
+| `keeper_reconciliation_matches_total` | Counter | Total number of execution-to-accounting matches confirmed |
+| `keeper_reconciliation_mismatches_total` | Counter | Total number of reconciliation mismatches detected |
+| `keeper_reconciliation_alerts_queued_total` | Counter | Total number of reconciliation alerts queued for delivery |
+| `keeper_reconciliation_alerts_sent_total` | Counter | Total number of reconciliation alerts delivered or emitted locally |
+| `keeper_reconciliation_alerts_failed_total` | Counter | Total number of reconciliation alerts that failed after retries |
+| `keeper_reconciliation_pipeline_errors_total` | Counter | Total number of reconciliation pipeline errors encountered |
+| `keeper_reconciliation_balance_drift` | Gauge | Current balance drift between expected and observed balances |
+| `keeper_reconciliation_pending_executions` | Gauge | Number of successful executions awaiting reconciliation confirmation |
 
 ### Default Process Metrics
 
