@@ -438,7 +438,7 @@ export default function Home() {
               aria-label="Connect your Stellar wallet"
               className="rounded-2xl bg-neutral-900 px-5 py-3 text-sm font-semibold text-neutral-100 transition hover:bg-neutral-800"
             >
-              Connect Wallet
+              {isWalletConnected ? `${walletAddress?.slice(0, 6)}...${walletAddress?.slice(-4)}` : "Connect Wallet"}
             </button>
           </div>
         </header>
