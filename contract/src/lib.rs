@@ -3364,7 +3364,7 @@ impl SoroTaskContract {
 mod test_gas;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use soroban_sdk::{
         contract, contractimpl,
@@ -3570,7 +3570,7 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    pub fn update_task(env: Env, task_id: u64, new_config: TaskConfig) {
+    pub(crate) fn update_task(env: Env, task_id: u64, new_config: TaskConfig) {
         let task_key = DataKey::Task(task_id);
 
         let existing: TaskConfig = env
@@ -5718,4 +5718,4 @@ mod proptest;
 mod test_combinations;
 
 #[cfg(test)]
-mod test_events;
+mod test_access_control;
